@@ -33,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/sha3"
+	"lukechampine.com/blake3"
 )
 
 const (
@@ -41,6 +42,7 @@ const (
 	cacheInitBytes      = 1 << 24 // Bytes in cache at genesis
 	cacheGrowthBytes    = 1 << 17 // Cache growth per epoch
 	epochLengthDefault  = 32000   // Default epoch length (blocks per epoch)
+	epochLength  = 32000   // Default epoch length (blocks per epoch)
 	epochLengthECIP1099 = 32000   // Blocks per epoch if ECIP-1099 is activated
 	mixBytes            = 128     // Width of mix
 	hashBytes           = 64      // Hash length in bytes
