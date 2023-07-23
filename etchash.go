@@ -37,12 +37,12 @@ import (
 	"time"
 	"unsafe"
 
-	mmap "github.com/edsrzf/mmap-go"
+	"github.com/edsrzf/mmap-go"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	lrupkg "github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/hashicorp/golang-lru/simplelru"
 )
 
 var (
@@ -90,6 +90,7 @@ func isLittleEndian() bool {
 }
 
 // uint32Array2ByteArray returns the bytes represented by uint32 array c
+// nolint:unused
 func uint32Array2ByteArray(c []uint32) []byte {
 	buf := make([]byte, len(c)*4)
 	if isLittleEndian() {
@@ -178,13 +179,16 @@ func memoryMapAndGenerate(path string, size uint64, lock bool, generator func(bu
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if err = dump.Truncate(int64(len(dumpMagic))*4 + int64(size)); err != nil {
+	if err = ensureSize(dump, int64(len(dumpMagic))*4+int64(size)); err != nil {
+		dump.Close()
+		os.Remove(temp)
 		return nil, nil, nil, err
 	}
 	// Memory map the file for writing and fill it with the generator
 	mem, buffer, err := memoryMapFile(dump, true)
 	if err != nil {
 		dump.Close()
+		os.Remove(temp)
 		return nil, nil, nil, err
 	}
 	copy(buffer, dumpMagic)
@@ -204,39 +208,54 @@ func memoryMapAndGenerate(path string, size uint64, lock bool, generator func(bu
 	return memoryMap(path, lock)
 }
 
+type cacheOrDataset interface {
+	*cache | *dataset
+}
+
 // lru tracks caches or datasets by their last use time, keeping at most N of them.
-type lru struct {
+type lru[T cacheOrDataset] struct {
 	what string
-	new  func(epoch uint64, epochLength uint64) interface{}
+	new  func(epoch uint64, epochLength uint64) T
 	mu   sync.Mutex
 	// Items are kept in a LRU cache, but there is a special case:
 	// We always keep an item for (highest seen epoch) + 1 as the 'future item'.
-	cache      *simplelru.LRU
+	cache      lrupkg.BasicLRU[uint64, T]
 	future     uint64
-	futureItem interface{}
+	futureItem T
 }
 
 // newlru create a new least-recently-used cache for either the verification caches
 // or the mining datasets.
-func newlru(what string, maxItems int, new func(epoch uint64, epochLength uint64) interface{}) *lru {
-	if maxItems <= 0 {
-		maxItems = 1
+func newlru[T cacheOrDataset](maxItems int, new func(epoch uint64, epochLength uint64) T) *lru[T] {
+	var what string
+	switch any(T(nil)).(type) {
+	case *cache:
+		what = "cache"
+	case *dataset:
+		what = "dataset"
+	default:
+		panic("unknown type")
 	}
-	cache, _ := simplelru.NewLRU(maxItems, func(key, value interface{}) {
-		log.Trace("Evicted etchash "+what, "epoch", key)
-	})
-	return &lru{what: what, new: new, cache: cache}
+	return &lru[T]{
+		what:  what,
+		new:   new,
+		cache: lrupkg.NewBasicLRU[uint64, T](maxItems),
+	}
 }
 
 // get retrieves or creates an item for the given epoch. The first return value is always
 // non-nil. The second return value is non-nil if lru thinks that an item will be useful in
 // the near future.
-func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (item, future interface{}) {
+func (lru *lru[T]) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (item, future T) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
+	// Use the sum of epoch and epochLength as the cache key.
+	// This is not perfectly safe, but it's good enough (at least for the first 30000 epochs, or the first 427 years).
+	cacheKey := epochLength + epoch
+
 	// Get or create the item for the requested epoch.
-	item, ok := lru.cache.Get(epoch)
+	item, ok := lru.cache.Get(cacheKey)
 	if !ok {
 		if lru.future > 0 && lru.future == epoch {
 			item = lru.futureItem
@@ -244,7 +263,7 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 			log.Trace("Requiring new etchash "+lru.what, "epoch", epoch)
 			item = lru.new(epoch, epochLength)
 		}
-		lru.cache.Add(epoch, item)
+		lru.cache.Add(cacheKey, item)
 	}
 
 	// Ensure pre-generation handles ecip-1099 changeover correctly
@@ -252,6 +271,9 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 	var nextEpochLength = epochLength
 	if ecip1099FBlock != nil {
 		nextEpochBlock := nextEpoch * epochLength
+		// Note that == demands that the ECIP1099 activation block is situated
+		// at the beginning of an epoch.
+		// https://github.com/ethereumclassic/ECIPs/blob/master/_specs/ecip-1099.md#implementation
 		if nextEpochBlock == *ecip1099FBlock && epochLength == epochLengthDefault {
 			nextEpoch = nextEpoch / 2
 			nextEpochLength = epochLengthECIP1099
@@ -259,7 +281,9 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 	}
 
 	// Update the 'future item' if epoch is larger than previously seen.
-	if epoch < maxEpoch-1 && lru.future < nextEpoch {
+	// Last conditional clause ('lru.future > nextEpoch') handles the ECIP1099 case where
+	// the next epoch is expected to be LESSER THAN that of the previous state's future epoch number.
+	if epoch < maxEpoch-1 && lru.future != nextEpoch {
 		log.Trace("Requiring new future etchash "+lru.what, "epoch", nextEpoch)
 		future = lru.new(nextEpoch, nextEpochLength)
 		lru.future = nextEpoch
@@ -280,52 +304,8 @@ type cache struct {
 	used        time.Time
 }
 
-// isBadCache checks a given caches/datsets keccak256 hash against bad caches (ecip-1099)
-// this is incase the client has already written non-ecip1099 caches to disk,
-// instead of blindly trusting as seedhashes/filename match, compare checksums.
-func isBadCache(epoch uint64, epochLength uint64, data []uint32) (bool, string) {
-	// Check for bad caches/datasets at ecip-1099 transitions
-	if epochLength == epochLengthECIP1099 {
-		var badCache string
-		var badDataset string
-		var hash string
-
-		if epoch == 42 { // mordor
-			hash = uint32Array2Keccak256(data)
-			// bad cache generated using: geth makecache 2520001 [path] --epoch.length=30000
-			badCache = "0xafa2a00911843b0a67314614e629d9e550ef74da4dca2215c475a0f93333aedc"
-			// bad dataset generated using: geth makedag 2520001 [path] --epoch.length=30000
-			badDataset = "0xc07d08a9f8a2b5af0e87f68c8df9eaf28d7cef2ae3fe86d8c306d9139861c15f"
-		}
-		if epoch == 195 { // classic mainnet
-			hash = uint32Array2Keccak256(data)
-			// bad cache generated using: geth makecache 11700001 [path] --epoch.length=30000
-			badCache = "0x5794130ea9e433185214fb4032edbd3473499267e197d9003a6a1a5bd300b3e5"
-			// bad dataset generated using: geth makedag 11700001 [path] --epoch.length=30000
-			badDataset = "0xe9cc9df33ee6de075558fb07fd67d59068a9751c36c6e9ae38163f6da90a2240"
-		}
-		if epoch == 196 { // classic mainnet
-			hash = uint32Array2Keccak256(data)
-			// bad cache generated using: geth makecache 11760001 [path] --epoch.length=30000
-			badCache = "0x4a37ee8c8cb4f75c05e23369cadeec7a6ed7386226a629794a733e0249d92d5f"
-			// bad dataset generated using: geth makedag 11760001 [path] --epoch.length=30000
-			badDataset = "0xf281b059ce535a7c146c00ada26114406bc08a9657bf9147542f92f9f9f08bf2"
-		}
-		// check if cache is bad
-		if hash != "" && (hash == badCache || hash == badDataset) {
-			// cache/dataset is bad.
-			return true, hash
-		}
-		// cache is good
-		return false, hash
-	}
-	// cache is not ecip-1099 enabled
-	return false, ""
-}
-
-// newCache creates a new etchash verification cache and returns it as a plain Go
-// interface to be usable in an LRU cache.
-func newCache(epoch uint64, epochLength uint64, uip1Epoch *uint64) interface{} {
+// newCache creates a new ethash verification cache.
+func newCache(epoch uint64, epochLength uint64, uip1Epoch *uint64) *cache {
 	return &cache{epoch: epoch, epochLength: epochLength, uip1Epoch: uip1Epoch}
 }
 
@@ -348,8 +328,14 @@ func (c *cache) generate(dir string, limit int, lock bool, test bool) {
 		if !isLittleEndian() {
 			endian = ".be"
 		}
-		path := filepath.Join(dir, fmt.Sprintf("cache-R%d-%x%s", algorithmRevision, seed[:8], endian))
-		logger := log.New("epoch", c.epoch)
+
+		// The file path naming scheme was changed to include epoch values in the filename,
+		// which enables a filepath glob with scan to identify out-of-bounds caches and remove them.
+		// The legacy path declaration is provided below as a comment for reference.
+		//
+		// path := filepath.Join(dir, fmt.Sprintf("cache-R%d-%x%s", algorithmRevision, seed[:8], endian))                 // LEGACY
+		path := filepath.Join(dir, fmt.Sprintf("cache-R%d-%d-%x%s", algorithmRevision, c.epoch, seed[:8], endian)) // CURRENT
+		logger := log.New("epoch", c.epoch, "epochLength", c.epochLength)
 
 		// We're about to mmap the file, ensure that the mapping is cleaned up when the
 		// cache becomes unused.
@@ -360,13 +346,7 @@ func (c *cache) generate(dir string, limit int, lock bool, test bool) {
 		c.dump, c.mmap, c.cache, err = memoryMap(path, lock)
 		if err == nil {
 			logger.Debug("Loaded old etchash cache from disk")
-			isBad, hash := isBadCache(c.epoch, c.epochLength, c.cache)
-			if isBad {
-				// cache is bad. Set err, then continue as if cache could not be read from disk.
-				err = fmt.Errorf("Cache with hash %s has been flagged as bad", hash)
-			} else {
-				return
-			}
+			return
 		}
 		logger.Debug("Failed to load old etchash cache", "err", err)
 
@@ -378,11 +358,33 @@ func (c *cache) generate(dir string, limit int, lock bool, test bool) {
 			c.cache = make([]uint32, size/4)
 			generateCache(c.cache, c.epoch, c.epochLength, c.uip1Epoch, seed)
 		}
-		// Iterate over all previous instances and delete old ones
-		for ep := int(c.epoch) - limit; ep >= 0; ep-- {
-			seed := seedHash(uint64(ep)*c.epochLength + 1)
-			path := filepath.Join(dir, fmt.Sprintf("cache-R%d-%x%s", algorithmRevision, seed[:8], endian))
-			os.Remove(path)
+		// Iterate over all cache file instances, deleting any out of bounds (where epoch is below lower limit, or above upper limit).
+		matches, _ := filepath.Glob(filepath.Join(dir, fmt.Sprintf("cache-R%d*", algorithmRevision)))
+		for _, file := range matches {
+			var ar int   // algorithm revision
+			var e uint64 // epoch
+			var s string // seed
+			if _, err := fmt.Sscanf(filepath.Base(file), "cache-R%d-%d-%s"+endian, &ar, &e, &s); err != nil {
+				// There is an unrecognized file in this directory.
+				// See if the name matches the expected pattern of the legacy naming scheme.
+				if _, err := fmt.Sscanf(filepath.Base(file), "cache-R%d-%s"+endian, &ar, &s); err == nil {
+					// This file matches the previous generation naming pattern (sans epoch).
+					if err := os.Remove(file); err != nil {
+						logger.Error("Failed to remove legacy ethash cache file", "file", file, "err", err)
+					} else {
+						logger.Warn("Deleted legacy ethash cache file", "path", file)
+					}
+				}
+				// Else the file is unrecognized (unknown name format), leave it alone.
+				continue
+			}
+			if e <= c.epoch-uint64(limit) || e > c.epoch+1 {
+				if err := os.Remove(file); err == nil {
+					logger.Debug("Deleted ethash cache file", "target.epoch", e, "file", file)
+				} else {
+					logger.Error("Failed to delete ethash cache file", "target.epoch", e, "file", file, "err", err)
+				}
+			}
 		}
 	})
 }
@@ -420,7 +422,7 @@ type Light struct {
 }
 
 // Verify checks whether the block's nonce is valid.
-func (l *Light) Verify(block Block) (bool, int64){
+func (l *Light) Verify(block Block) (bool, int64) {
 	// TODO: do etchash_quick_verify before getCache in order
 	// to prevent DOS attacks.
 	blockNum := block.NumberU64()
@@ -534,7 +536,7 @@ func (l *Light) getCache(blockNum uint64) *cache {
 	return c
 }
 
-/// dataset wraps an etchash dataset with some metadata to allow easier concurrent use.
+// / dataset wraps an etchash dataset with some metadata to allow easier concurrent use.
 type dataset struct {
 	epoch       uint64    // Epoch for which this cache is relevant
 	epochLength uint64    // Epoch length (ECIP-1099)
@@ -543,13 +545,13 @@ type dataset struct {
 	mmap        mmap.MMap // Memory map itself to unmap before releasing
 	dataset     []uint32  // The actual cache data content
 	once        sync.Once // Ensures the cache is generated only once
-	done        uint32    // Atomic flag to determine generation status
+	done        atomic.Bool // Atomic flag to determine generation status
 	used        time.Time
 }
 
 // newDataset creates a new etchash mining dataset and returns it as a plain Go
 // interface to be usable in an LRU cache.
-func newDataset(epoch uint64, epochLength uint64, uip1Epoch *uint64) interface{} {
+func newDataset(epoch uint64, epochLength uint64, uip1Epoch *uint64) *dataset {
 	return &dataset{epoch: epoch, epochLength: epochLength, uip1Epoch: uip1Epoch}
 }
 
@@ -557,7 +559,7 @@ func newDataset(epoch uint64, epochLength uint64, uip1Epoch *uint64) interface{}
 func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 	d.once.Do(func() {
 		// Mark the dataset generated after we're done. This is needed for remote
-		defer atomic.StoreUint32(&d.done, 1)
+		defer d.done.Store(true)
 
 		csize := cacheSize(d.epoch)
 		dsize := datasetSize(d.epoch)
@@ -581,7 +583,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 		if !isLittleEndian() {
 			endian = ".be"
 		}
-		path := filepath.Join(dir, fmt.Sprintf("full-R%d-%x%s", algorithmRevision, seed[:8], endian))
+		path := filepath.Join(dir, fmt.Sprintf("full-R%d-%d-%x%s", algorithmRevision, d.epoch, seed[:8], endian))
 		logger := log.New("epoch", d.epoch)
 
 		// We're about to mmap the file, ensure that the mapping is cleaned up when the
@@ -593,16 +595,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 		d.dump, d.mmap, d.dataset, err = memoryMap(path, lock)
 		if err == nil {
 			logger.Debug("Loaded old etchash dataset from disk", "path", path)
-			isBad, hash := isBadCache(d.epoch, d.epochLength, d.dataset)
-			if isBad {
-				// dataset is bad. Continue as if cache could not be read from disk.
-				err = fmt.Errorf("Dataset with hash %s has been flagged as bad", hash)
-				// regenerating DAG is a intensive process, we should let the user know
-				// why it's happening.
-				logger.Error("Bad DAG on disk", "path", path, "hash", hash)
-			} else {
-				return
-			}
+			return
 		}
 		logger.Debug("Failed to load old etchash dataset", "err", err)
 
@@ -614,14 +607,36 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 		if err != nil {
 			logger.Error("Failed to generate mapped etchash dataset", "err", err)
 
-			d.dataset = make([]uint32, dsize/2)
+			d.dataset = make([]uint32, dsize/4)
 			generateDataset(d.dataset, d.epoch, d.epochLength, cache)
 		}
-		// Iterate over all previous instances and delete old ones
-		for ep := int(d.epoch) - limit; ep >= 0; ep-- {
-			seed := seedHash(uint64(ep)*d.epochLength + 1)
-			path := filepath.Join(dir, fmt.Sprintf("full-R%d-%x%s", algorithmRevision, seed[:8], endian))
-			os.Remove(path)
+		// Iterate over all full file instances, deleting any out of bounds (where epoch is below lower limit, or above upper limit).
+		matches, _ := filepath.Glob(filepath.Join(dir, fmt.Sprintf("full-R%d*", algorithmRevision)))
+		for _, file := range matches {
+			var ar int   // algorithm revision
+			var e uint64 // epoch
+			var s string // seed
+			if _, err := fmt.Sscanf(filepath.Base(file), "full-R%d-%d-%s"+endian, &ar, &e, &s); err != nil {
+				// There is an unrecognized file in this directory.
+				// See if the name matches the expected pattern of the legacy naming scheme.
+				if _, err := fmt.Sscanf(filepath.Base(file), "full-R%d-%s"+endian, &ar, &s); err == nil {
+					// This file matches the previous generation naming pattern (sans epoch).
+					if err := os.Remove(file); err != nil {
+						logger.Error("Failed to remove legacy ethash full file", "file", file, "err", err)
+					} else {
+						logger.Warn("Deleted legacy ethash full file", "path", file)
+					}
+				}
+				// Else the file is unrecognized (unknown name format), leave it alone.
+				continue
+			}
+			if e <= d.epoch-uint64(limit) || e > d.epoch+1 {
+				if err := os.Remove(file); err == nil {
+					logger.Debug("Deleted ethash full file", "target.epoch", e, "file", file)
+				} else {
+					logger.Error("Failed to delete ethash full file", "target.epoch", e, "file", file, "err", err)
+				}
+			}
 		}
 	})
 }
@@ -630,7 +645,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 // or not (it may not have been started at all). This is useful for remote miners
 // to default to verification caches instead of blocking on DAG generations.
 func (d *dataset) generated() bool {
-	return atomic.LoadUint32(&d.done) == 1
+	return d.done.Load()
 }
 
 // finalizer closes any file handlers and memory maps open.
