@@ -29,7 +29,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
-	"github.com/ethereum/go-ethereum/crypto"
+	//"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/sha3"
@@ -224,14 +224,6 @@ func generateCache(dest []uint32, epoch uint64, epochLength uint64, uip1Epoch *u
 	}()
 	// Create a hasher to reuse between invocations
 	hasherCB := makeHasher(sha3.NewLegacyKeccak512())
-	// uip1 - (ubqhash)
-	if uip1Epoch != nil {
-		if epoch >= *uip1Epoch {
-			h, _ := blake2b.New512(nil)
-			keccak512 = blakeHasher(h) // use blakeHasher instead of makeHasher here.
-		}
-	}
-
 	// Sequentially produce the initial dataset
 	hasherCB(cache, seed)
 	for offset := uint64(hashBytes); offset < size; offset += hashBytes {
